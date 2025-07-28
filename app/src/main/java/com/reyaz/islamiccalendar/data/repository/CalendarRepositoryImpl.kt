@@ -2,6 +2,7 @@ package com.reyaz.islamiccalendar.data.repository
 
 import android.content.Context
 import android.util.Log
+import com.reyaz.islamiccalendar.data.local.PrefDataStore.PrefDataStore
 import com.reyaz.islamiccalendar.data.local.dao.CalendarDao
 import com.reyaz.islamiccalendar.data.local.entity.CalMonthEntity
 import com.reyaz.islamiccalendar.data.local.entity.MonthWithDates
@@ -12,42 +13,63 @@ import com.reyaz.islamiccalendar.domain.model.CalDate
 import com.reyaz.islamiccalendar.domain.model.CompleteCalendar
 import com.reyaz.islamiccalendar.domain.repository.CalendarRepository
 import com.reyaz.islamiccalendar.utils.NetworkUtils
+import com.reyaz.islamiccalendar.utils.toFormattedDateTime
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import kotlinx.datetime.Clock
-import kotlinx.datetime.LocalDate
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.CancellationException
 
 private const val TAG = "CALENDAR_REPOSITORY_IMPL"
 
 class CalendarRepositoryImpl(
     private val apiService: AlAdhanApiService,
     private val calendarDao: CalendarDao,
-    private val appContext: Context
+    private val appContext: Context,
+    private val dataStore: PrefDataStore
 ) : CalendarRepository {
 
     override fun observeCalendar(month: Int?, year: Int?): Flow<Result<CompleteCalendar>> = flow {
         try {
-            if (!NetworkUtils.isInternetAvailable(appContext)) {
-                emit(Result.failure(Exception("No internet connection")))
-                return@flow
-            }
             var targetMonth = month
             var targetYear = year
+            var shouldSaveExpiry = false
+
+            if (targetMonth == null || targetYear == null) {        // current month calendar showing
+                val currTime = System.currentTimeMillis()
+                val dataExpiredTime = dataStore.expiredTimestamp.first()
+//                Log.d(TAG, "Data Expired Time: ${dataExpiredTime.toFormattedDateTime()} and Current Time: ${currTime.toFormattedDateTime()}")
+                if (currTime < dataExpiredTime) {
+                    targetMonth = dataStore.hijriMonth.first()
+                    targetYear = dataStore.hijriYear.first()
+//                    Log.d(TAG, "Month : ${month}")
+                } else {
+//                    Log.d(TAG, "Expired!")
+                    shouldSaveExpiry = true
+                }
+            }
+
             coroutineScope {
                 if (targetMonth == null || targetYear == null) {
+                    if (!NetworkUtils.isInternetAvailable(appContext)) {
+                        emit(Result.failure(Exception("No internet connection")))
+                        throw Exception("No internet available")
+                    }
                     val currentMonthDeferred = async { apiService.getCurrentIslamicMonth() }
                     val currentYearDeferred = async { apiService.getCurrentIslamicYear() }
 
                     val monthResponse = currentMonthDeferred.await()
                     val yearResponse = currentYearDeferred.await()
-
                     if (monthResponse.isSuccessful && yearResponse.isSuccessful) {
                         targetMonth = monthResponse.body()?.data
                             ?: throw IllegalStateException("Null current month")
@@ -56,13 +78,19 @@ class CalendarRepositoryImpl(
                     } else {
                         throw IllegalStateException("Month/year fetch failed: month=${monthResponse.code()}, year=${yearResponse.code()}")
                     }
-                    Log.d(TAG, "Month: $targetMonth, Year: $targetYear")
+
+                    dataStore.setCurrHijriMonth(targetMonth!!)
+                    dataStore.setCurrHijriYear(targetYear!!)
+
+                    //Log.d(TAG, "Month: $targetMonth, Year: $targetYear")
                 }
                 Log.d(TAG, "Out from coroutine")
 
                 // current calendar fetching
-                getHijriCalendarWithGeorgian(targetMonth!!, targetYear!!)
+                getHijriCalendarWithGeorgianAndSave(targetMonth!!, targetYear!!, shouldSaveExpiry)
             }
+
+
             if (targetMonth == null || targetYear == null) throw IllegalStateException("Null month or year")
             // Fetch and cache leading, current, trailing months in parallel
             val leadingMonthYear = adjustMonthYear(targetMonth!! - 1, targetYear!!)
@@ -71,23 +99,27 @@ class CalendarRepositoryImpl(
             coroutineScope {
                 val fetchResults = listOf(
                     async {
-                        getHijriCalendarWithGeorgian(
+                        getHijriCalendarWithGeorgianAndSave(
                             leadingMonthYear.first,
-                            leadingMonthYear.second
+                            leadingMonthYear.second,
+                            shouldSaveExpiry = false
                         )
                     },
 
                     async {
-                        getHijriCalendarWithGeorgian(
+                        getHijriCalendarWithGeorgianAndSave(
                             trailingMonthYear.first,
-                            trailingMonthYear.second
+                            trailingMonthYear.second,
+                            shouldSaveExpiry = false
                         )
                     }
                 ).map { it.await() }
 
                 if (fetchResults.any { it.isFailure }) {
+                    Log.d(TAG, "Calendar fetch failed}")
                     emit(Result.failure(Exception("Calendar fetch failed")))
                     return@coroutineScope
+//                    throw Exception("No Internet")
                 }
             }
 
@@ -98,14 +130,18 @@ class CalendarRepositoryImpl(
                 calendarDao.getMonthWithDates(trailingMonthYear.first, trailingMonthYear.second)
 
             // Generate 5-row calendar grid starting Monday
+            if (localCurrentDates == null || localLeadingDates == null || localTrailingDates == null) {
+                throw IllegalStateException("Please connect to internet and try again")
+            }
+
             val calendarGrid = generateCalendarGrid(
                 currentCal = localCurrentDates,
                 leadingCal = localLeadingDates,
                 trailingCal = localTrailingDates
             )
-            val currentHijriMonthDayIndex: Int? = getTodaysIndex( calendarGrid)
+            val currentHijriMonthDayIndex: Int? = getTodaysIndex(calendarGrid)
 
-            Log.d(TAG, "Current Hijri Month Day Index: $currentHijriMonthDayIndex")
+            //Log.d(TAG, "Current Hijri Month Day Index: $currentHijriMonthDayIndex")
 
             emit(
                 Result.success(
@@ -139,7 +175,10 @@ class CalendarRepositoryImpl(
         val sysYear = calendar.year
         val currentHijriMonthDayIndex: Int? = calendarGrid.indexOfFirst { calDate ->
 //            Log.d(TAG, "${calDate.gregorianMonthName} == ${sysMonthName} ")
-            calDate.isIncluded && calDate.gregorianDate == sysDayOfMonth && calDate.gregorianMonthName.equals(sysMonthName, ignoreCase = true)
+            calDate.isIncluded && calDate.gregorianDate == sysDayOfMonth && calDate.gregorianMonthName.equals(
+                sysMonthName,
+                ignoreCase = true
+            )
                     && calDate.gregorianYear == sysYear
         }.takeIf { it != -1 }
         return currentHijriMonthDayIndex
@@ -196,9 +235,10 @@ class CalendarRepositoryImpl(
         return result
     }
 
-    override suspend fun getHijriCalendarWithGeorgian(
+    override suspend fun getHijriCalendarWithGeorgianAndSave(
         month: Int,
-        year: Int
+        year: Int,
+        shouldSaveExpiry: Boolean
     ): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             val isExists = calendarDao.isCalExists(month, year)
@@ -209,6 +249,11 @@ class CalendarRepositoryImpl(
             }
 
             Log.d(TAG, "No Cache Present")
+
+            if (!NetworkUtils.isInternetAvailable(appContext)) {
+                throw Exception("No internet connection")
+            }
+            Log.d(TAG, "Fetching from server")
             val calendarResult = apiService.getHijriCalendarWithGeorgian(month, year)
 
             if (calendarResult.isSuccessful) {
@@ -223,6 +268,18 @@ class CalendarRepositoryImpl(
                     hijriMonthName = monthName,
                     dtoList = calendarData
                 )
+                if (shouldSaveExpiry) {
+                    val dateString = calendarData.lastOrNull()?.gregorian?.date
+                    val dateWithTimeString = dateString?.let { "$it 11:59:59 PM" }
+                    val sdf = SimpleDateFormat("dd-MM-yyyy hh:mm:ss a", Locale.getDefault())
+                    val date: Date? = dateWithTimeString?.let { sdf.parse(it) }
+                    val timestampMillis = date?.time
+//                    val lastGregorianDate = calendarData.lastOrNull()?.gregorian?.date?.take(2)?.toInt() ?: 0
+//                    val lastGregorianMonth = calendarData.lastOrNull()?.gregorian?.month?.number
+//                    val expiryTimeStamp = System.currentTimeMillis() + (lastGregorianDate * 24 * 60 * 60 * 1000)
+                    dataStore.setExpiryDate(timestampMillis ?: 0)
+//                    Log.d(TAG, "Expiry date set to: $expiryTimeStamp")
+                }
                 return@withContext Result.success(Unit)
             } else {
                 throw IllegalStateException("Calendar fetch failed: ${calendarResult.code()}")
@@ -230,7 +287,7 @@ class CalendarRepositoryImpl(
 
         } catch (e: Exception) {
             Log.e(TAG, "getHijriCalendarWithGeorgian error", e)
-            Result.failure(e)
+            Result.failure(Exception("Error while fetching for $month, $year : $e"))
         }
     }
 

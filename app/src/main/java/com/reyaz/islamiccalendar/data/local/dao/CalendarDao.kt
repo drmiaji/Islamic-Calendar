@@ -20,7 +20,7 @@ interface CalendarDao {
 
     @Transaction
     @Query("SELECT * FROM cal_month WHERE month = :month AND year = :year LIMIT 1")
-    suspend fun getMonthWithDates(month: Int, year: Int): MonthWithDates
+    suspend fun getMonthWithDates(month: Int, year: Int): MonthWithDates?
 
     @Query("SELECT * FROM cal_date WHERE gregorianDate = :date LIMIT 1")
     suspend fun getDate(date: String): CalDateEntity?
